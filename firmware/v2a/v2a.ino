@@ -1,0 +1,337 @@
+#include "Adafruit_MAX31856.h"
+#include <SoftwareSerial.h>
+#include <string.h>
+
+
+//pinout variables
+int blueTx = 1;
+int blueRx = 0;
+int relayPins[2] = {22, 23}; //A9 A8
+#define LED 13
+#define spi_SCK  13 //also wired to LED, but that is no problem. distributed to both max boards.
+#define spi_SDO  12 //bus, labeled MISO on teensy
+#define spi_SDI  11 //bus, labeled MOSI on teensy 
+#define spi_CS0 9  // digital io (9)
+#define spi_CS1 10  // reserved CS (10)
+int spi_FAULT[2] = {5, 6}; //in case thermocouple amp is saturated. //UNUSED. faults are reported as SPI packets
+
+//setup bluetooth serial port
+SoftwareSerial hc(blueRx,blueTx); //currently rfcomm2
+
+
+
+//data formatting
+//Formats as a json object, with different
+//channels being different objects. so
+//sends: '[{"topic": "Teensy1/A0", "data": temp}, {"topic":"Teensy1/A1", "data": temp}, ...]'
+String buf;
+String teensyID = "Teensy1"; //Evan's Teensy ID 
+
+String state; //the state of the teensy, the set of actions it takes at each loop cycle
+
+int communicationErrors = 0; //keeping track of any errors that are caught by checksum
+
+//control variables
+int relayStates[2] = {0, 0}; 
+double temps[2] = {20, 20}; //temps in C
+double cjTemps[2] = {20, 20}; //temperature of the max31856 cold junction, for monitoring failures.
+bool tcFault[2] = {0, 0}; //fault flags.
+double setpoints[2] = {10, 10};
+
+
+
+//thermocouples. This option doesn't quite work for some reason, called "Software SPI"
+//Adafruit_MAX31856 maxBoards[2] = {Adafruit_MAX31856(spi_CS0, spi_SDI, spi_SDO, spi_SCK), 
+//                                  Adafruit_MAX31856(spi_CS1, spi_SDI, spi_SDO, spi_SCK)};
+
+//Hardware SPI seems to work well though, so I guess the board is wired correctly.
+Adafruit_MAX31856 maxBoards[2] = {Adafruit_MAX31856(spi_CS0), 
+                                  Adafruit_MAX31856(spi_CS1)};
+
+
+void setup(){
+
+  //intialize relay pins
+  for(int i = 0; i < 2; i++)
+  {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], LOW); //initial state is low
+    pinMode(spi_FAULT[i], INPUT); //monitoring faults.
+  }
+  
+
+  //Initialize Bluetooth Serial Port
+  hc.begin(9600);
+  Serial.begin(9600);
+  Serial.println("Testing WiDaq board");
+  //clear the command buffer
+  while(hc.available())
+  {
+    hc.read();
+  }
+  
+
+  //initialize thermocouples
+  for(int i = 0; i < 2; i++)
+  {
+    if(!maxBoards[i].begin())
+    {
+      Serial.print("Could not initialize max31856 object number "); Serial.println(i);
+      continue;
+    }
+    maxBoards[i].setThermocoupleType(MAX31856_TCTYPE_K);
+    maxBoards[i].setConversionMode(MAX31856_CONTINUOUS);
+  }
+
+  state = "default"; //enter in the default state
+
+}
+
+
+//this loop is set up to be the "top" of each iteration. at each iteration,
+//the "state machine" that it is supposed to run is executed in a separate function.
+//the state will change based on user input, which is organized by a case-switch and
+//a memory of the present state.
+void loop(){
+
+  String newstate = checkForInputBlue(); //loads the state string using inputs from the bluetooth
+  //String newstate = checkForInputSer(); //loads the state string using input from the USB-serial input
+ 
+  if(newstate != "")
+  {
+    state = newstate;
+  }
+
+  Serial.print("State is presently: ");
+  Serial.println(state);
+  
+  //this large if statement controls which function is going to be performed during this loop
+  //default state
+  if(state == "default")
+  {
+    stateDualTempControl();
+  }
+  else if(state == "blink")
+  {
+    //toggle the LED pin using the opposite of its present value
+    digitalWrite(LED, !digitalRead(LED));
+  }
+  //a specific mode for stress testing comms efficiency
+  else if(state == "checksum")
+  {
+    stateChecksumMode();
+  }
+  else
+  {
+    stateDualTempControl(); //the default again
+  }
+  Serial.print("So far there have been "); 
+  Serial.print(communicationErrors);
+  Serial.println(" communication errors");
+  delay(1000);
+}
+
+String checkForInputBlue()
+{
+  String message = "";
+  if (hc.available())
+  {  
+    while(hc.available())
+    {
+      message += hc.readString();
+    }
+    message.trim(); //trim trailing/leading spaces and such. 
+    message.toLowerCase(); //case insensitive
+  }
+
+  return message; //"" by default
+}
+
+
+String checkForInputSer()
+{
+  String message = "";
+  if (Serial.available())
+  {  
+    while(Serial.available())
+    {
+      message += Serial.readString();
+    }
+    message.trim(); //trim trailing/leading spaces and such. 
+    message.toLowerCase(); //case insensitive
+  }
+  return message;
+}
+
+
+
+
+/*****State functions ******/
+
+
+//a loop based 2-relay temperature control system
+void stateDualTempControl()
+{
+  measureTemperatures();
+  calculateRelayStates();
+  updateRelayStates();
+
+  //uncomment for info on the usb serial line
+  
+  Serial.print("TC temps: ");
+  Serial.print(temps[0]); Serial.print(", "); Serial.print(temps[1]);
+  Serial.print("   TC CJ temps: ");
+  Serial.print(cjTemps[0]); Serial.print(", "); Serial.print(cjTemps[1]);
+  Serial.print("   Relay States: ");
+  Serial.print(relayStates[0]); Serial.print(", "); Serial.println(relayStates[1]);  
+
+  //create a function that fills a string buffer with your
+  //chosen data format. 
+  //string buf;
+  //buf = formBluetoothPacket();
+  //char bluetoothPacket[buf.length()];
+  //buf.toCharArray(bluetoothPacket, buf.length());
+  //hc.write(bluetoothPacket);
+}
+
+/* saving some work, not operational at the moment
+void stateManualRelayControl()
+{
+  if(message.length() == 4)
+    {
+      char mes[4];
+      message.toCharArray(mes, 4);
+      Serial.println(mes);
+      int statesTemp[2];
+      statesTemp[0] = atoi(&mes[0]);
+      statesTemp[1] = atoi(&mes[2]);
+      for(int i = 0; i < 2; i++)
+      {
+        if(statesTemp[i] > 1)
+        {
+          statesTemp[i] = 1;
+        }
+        else if(statesTemp[i] < 0)
+        {
+          statesTemp[i] = 0;
+        }
+        relayStates[i] = statesTemp[i];
+      }
+    }
+}
+*/
+
+//this sends an in-sequence integer string delimited by commas
+//to the bluetooth transmitter, the last value representing
+//the sum. It then waits for a response on the receiver line from
+//the raspberry pi that has another in-sequence integer string with 
+//sum at the end. Both parties check the order of the sequence and that the
+//sum is correct. Both parties know the start and end number. 
+void stateChecksumMode()
+{
+  int n = 1000; //integers from 0 to n-1 are stringified and sent
+  String messageOut = ""; //will be populated with the string data
+  int checksum = 0; //sums integers included
+  for(int i = 0; i < n; i++)
+  {
+    messageOut += String(i) + ",";
+    checksum += i;
+  }
+  messageOut += String(checksum); //last element is a string
+  messageOut += "\n\r"; //needed for serial parser on node-red side.
+  
+  //send this along the transmit line
+  char bluetoothPacket[messageOut.length()]; //standard set of conversion operations
+  messageOut.toCharArray(bluetoothPacket, messageOut.length());
+  hc.write(bluetoothPacket);
+  Serial.print("That message is ");
+  Serial.print(sizeof(bluetoothPacket));
+  Serial.println(" bytes");
+
+  //seconds to wait for the RPi to respond with a similar message. 
+  //penalty for a timeout is returning to the default state.
+  int timeout = 60*1000; //milliseconds 
+  double t0 = millis(); //present time
+  double curtime = 0; //keeping track for timeout
+  String sumback; //message received from node-red, representing the sum it calculated
+  while(curtime < timeout)
+  {
+    sumback = checkForInputBlue(); //checks input, "" if nothing
+    if(sumback == "")
+    {
+      delay(300);
+    }
+    else
+    {
+      break; //we got a number possibly
+    }
+    curtime = millis() - t0;
+  }
+
+  //if the loop reached timeout
+  if(sumback == "")
+  {
+    Serial.println("Checksum mode reached a timeout, check the node-red receiver");
+    return;
+  }
+
+  //maybe do something here to protect against horrible inputs from bluetooth...
+  //not sure what that would be at the moment.
+  int sumfromnode = sumback.toInt();
+  //if it is wrong, log the error somehow
+  if(sumfromnode != checksum)
+  {
+    communicationErrors += 1;
+  }
+  else
+  {
+    Serial.println("Got the correct checksum!");
+  }
+  
+  return;
+}
+
+/*****Other Functions ******/
+
+
+//measures the temperatures of the thermocouples
+void measureTemperatures()
+{
+  for(int i = 0; i < 2; i++)
+  {
+    cjTemps[i] = maxBoards[i].readCJTemperature();
+    temps[i] = maxBoards[i].readThermocoupleTemperature();
+    //check for faults here
+    uint8_t fault = maxBoards[i].readFault();
+    if (fault) {
+      if (fault & MAX31856_FAULT_CJRANGE) Serial.println("Cold Junction Range Fault");
+      if (fault & MAX31856_FAULT_TCRANGE) Serial.println("Thermocouple Range Fault");
+      if (fault & MAX31856_FAULT_CJHIGH)  Serial.println("Cold Junction High Fault");
+      if (fault & MAX31856_FAULT_CJLOW)   Serial.println("Cold Junction Low Fault");
+      if (fault & MAX31856_FAULT_TCHIGH)  Serial.println("Thermocouple High Fault");
+      if (fault & MAX31856_FAULT_TCLOW)   Serial.println("Thermocouple Low Fault");
+      if (fault & MAX31856_FAULT_OVUV)    Serial.println("Over/Under Voltage Fault");
+      if (fault & MAX31856_FAULT_OPEN)    Serial.println("Thermocouple Open Fault");
+    }
+  }
+}
+
+
+//does the actual writing of relay states
+void updateRelayStates()
+{
+  for(int i = 0; i < 2; i++)
+  {
+    digitalWrite(relayPins[i], relayStates[i]);
+  }
+}
+
+//calculates based on some algorithm (such as PID)
+//what the relay states should be. presently not coded.
+void calculateRelayStates()
+{
+  for(int i = 0; i < 2; i++)
+  {
+    relayStates[i] = 0;
+  }
+}
