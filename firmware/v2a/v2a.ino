@@ -1,5 +1,4 @@
 #include "Adafruit_MAX31856.h"
-#include <SoftwareSerial.h>
 #include <string.h>
 
 
@@ -15,10 +14,12 @@ int relayPins[2] = {22, 23}; //A9 A8
 #define spi_CS1 10  // reserved CS (10)
 int spi_FAULT[2] = {5, 6}; //in case thermocouple amp is saturated. //UNUSED. faults are reported as SPI packets
 
-//setup bluetooth serial port
-SoftwareSerial hc(blueRx,blueTx); //currently rfcomm2
+//setup bluetooth serial port on pins 1 and 0, Serial1 in Teensy's hardware libraries
+#define hc Serial1
 
-
+//the serial data from bluetooth is kept organized and protected by start and end characters
+const char startMarker = '<';
+const char endMarker = '>';
 
 //data formatting
 //Formats as a json object, with different
@@ -62,7 +63,9 @@ void setup(){
 
   //Initialize Bluetooth Serial Port
   hc.begin(9600);
+  delay(1000);
   Serial.begin(9600);
+  delay(1000);
   Serial.println("Testing WiDaq board");
   //clear the command buffer
   while(hc.available())
@@ -96,28 +99,30 @@ void loop(){
 
   String newstate = checkForInputBlue(); //loads the state string using inputs from the bluetooth
   //String newstate = checkForInputSer(); //loads the state string using input from the USB-serial input
- 
-  if(newstate != "")
+  
+  //check if the message from bluetooth contains the flag for changing states
+  if(newstate.indexOf("statechange") != -1)
   {
+    Serial.print("State is presently: ");
+    Serial.println(state);
     state = newstate;
+    Serial.print("Changing to: ");
+    Serial.println(state);
   }
 
-  Serial.print("State is presently: ");
-  Serial.println(state);
-  
   //this large if statement controls which function is going to be performed during this loop
   //default state
-  if(state == "default")
+  if(state == "statechange: default")
   {
     stateDualTempControl();
   }
-  else if(state == "blink")
+  else if(state == "statechange: blink")
   {
     //toggle the LED pin using the opposite of its present value
     digitalWrite(LED, !digitalRead(LED));
   }
   //a specific mode for stress testing comms efficiency
-  else if(state == "checksum")
+  else if(state == "statechange: checksum")
   {
     stateChecksumMode();
   }
@@ -131,19 +136,44 @@ void loop(){
   delay(1000);
 }
 
+//a more strongly protected bluetooth receiver than
+//the serial receiver. had issues, so implemented start/end markers.
+//it waits for the end marker to appear, if it received a start marker. 
+
+//it seems like the HC06 has a maximum receive buffer of 62 chars or so...
+//***Must do for large RX sizes, find the location of your hardware files for
+//Teensy. On mac, one "Shows contents" of the Teensyduino application, then
+//Java/hardware/teensy/avr/cores/teensy4/HardwareSerial1.cpp and change the RX_BUFFER_SIZE
+//to 4096 (or however large you need)
 String checkForInputBlue()
 {
   String message = "";
-  if (hc.available())
+  boolean rxInProgress = false; //if we are receiving, i.e. inside < ... >
+  String cc; //current character received
+  boolean newData = false; //flag that says we have a new data packet
+  
+  while(hc.available() > 0 && newData == false)
   {  
-    while(hc.available())
+    cc = hc.read();
+    if(rxInProgress == true)
     {
-      message += hc.readString();
+      //add data to the message string if it isn't end marker
+      if(cc != endMarker)
+      {
+        message += cc;
+      }
+      //if its end marker, finish the process
+      else
+      {
+        rxInProgress = false;
+        newData = true; //kills the loop
+      }
     }
-    message.trim(); //trim trailing/leading spaces and such. 
-    message.toLowerCase(); //case insensitive
+    else if(cc == startMarker)
+    {
+      rxInProgress = true;
+    }
   }
-
   return message; //"" by default
 }
 
@@ -156,10 +186,10 @@ String checkForInputSer()
     while(Serial.available())
     {
       message += Serial.readString();
+      Serial.println(message);
     }
-    message.trim(); //trim trailing/leading spaces and such. 
-    message.toLowerCase(); //case insensitive
   }
+  Serial.println("done");
   return message;
 }
 
@@ -253,35 +283,93 @@ void stateChecksumMode()
   int timeout = 60*1000; //milliseconds 
   double t0 = millis(); //present time
   double curtime = 0; //keeping track for timeout
-  String sumback; //message received from node-red, representing the sum it calculated
+  String messageBack; //message received from node-red, representing the sum it calculated
+
+  //wait a few seconds for the RPi to process
+  delay(5000);
   while(curtime < timeout)
   {
-    sumback = checkForInputBlue(); //checks input, "" if nothing
-    if(sumback == "")
+    messageBack = checkForInputBlue(); //checks input, "" if nothing
+    if(messageBack == "")
     {
       delay(300);
     }
     else
     {
-      break; //we got a number possibly
+      break; //we got a m
     }
     curtime = millis() - t0;
   }
 
   //if the loop reached timeout
-  if(sumback == "")
+  if(messageBack == "")
   {
     Serial.println("Checksum mode reached a timeout, check the node-red receiver");
     return;
   }
 
-  //maybe do something here to protect against horrible inputs from bluetooth...
-  //not sure what that would be at the moment.
-  int sumfromnode = sumback.toInt();
+  //put a stupid ending flag, just an extra "," at the end for the parsing code
+  messageBack += ",";
+  Serial.print("That message is  ");
+  Serial.println(messageBack);
+
+  
+
+  //expected input from RPi: "0,1,2,3,4.....,sum". 
+  //split the string, which is first converted to char array
+  //to avoid dynamic memory allocation which is slow on arduino for large objects
+  char pimess[messageBack.length()];
+  messageBack.toCharArray(pimess, messageBack.length()); //the message in char[] format
+
+  
+  //here, n must be less than or equal to the number of numbers received in the message, otherwise
+  //the teensy will freeze. put in a check here if you want better protection. 
+  char *sumNums[n+1]; //n is defined above as the number of numbers in checksum packet, +1 is for the actual sum at the end
+  char *ptr = NULL; //used in parsing function
+  int index = 0;
+  //get pointers to delimiter indices in the pimess message
+  //allows for multiple delimiters, like ",:" will search for , and :
+  ptr = strtok(pimess, ","); 
+  //loop through expected delimiters
+  while(ptr != NULL)
+  {
+    sumNums[index] = ptr;
+    index++;
+    ptr = strtok(NULL, ",");
+  }
+
+  //loop through all of the received numbers and calculate sum
+  int newSum = 0;
+  //also calculate the order
+  bool outOfOrder = false;
+  int outOfOrderIndex;
+  int thenum; //temporary variable
+  for(int i = 0; i < n; i++)
+  {
+    thenum = atoi(sumNums[i]);
+    newSum += thenum;
+    if(outOfOrder == false && i > 0 && (thenum != (atoi(sumNums[i-1]) + 1)))
+    {
+      outOfOrder = true;
+      outOfOrderIndex = i;
+      Serial.print("Got out of order on : " );
+      Serial.println(outOfOrderIndex);
+    }
+  }
+
+  //get the sum that the RPi sent, which is last element. 
+  int sumfromnode = atoi(sumNums[n]);
+  
   //if it is wrong, log the error somehow
-  if(sumfromnode != checksum)
+  if(sumfromnode != newSum || outOfOrder)
   {
     communicationErrors += 1;
+    Serial.print("Got a communication error: ");
+    Serial.print(sumfromnode);
+    Serial.print(" != ");
+    Serial.print(newSum);
+    Serial.print(", or outOfOrder = ");
+    Serial.println(outOfOrder);
   }
   else
   {
