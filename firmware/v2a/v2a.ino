@@ -126,6 +126,10 @@ void loop(){
   {
     stateChecksumMode();
   }
+  else if(state == "statechange: blueconfig")
+  {
+    stateBlueConfig();
+  }
   else
   {
     stateDualTempControl(); //the default again
@@ -155,6 +159,7 @@ String checkForInputBlue()
   while(hc.available() > 0 && newData == false)
   {  
     cc = hc.read();
+    Serial.print(cc);
     if(rxInProgress == true)
     {
       //add data to the message string if it isn't end marker
@@ -377,6 +382,103 @@ void stateChecksumMode()
   }
   
   return;
+}
+
+
+//this function allows you to use the USB serial input to 
+//configure the HC06 bluetooth settings.
+void stateBlueConfig()
+{
+  Serial.println("What would you like to configure about the HC06?");
+  Serial.println("0 | HC06 baud");
+  Serial.println("1 | Bluetooth name");
+  Serial.println("2 | Pin code");
+  Serial.println("3 | Exit, re-enter default state");
+  Serial.print("> ");
+  while(!Serial.available())
+  {
+  }
+  String option = Serial.readString();
+  option = option.trim();
+  if(option == "0")
+  {
+    Serial.println("This function doesnt work for some reason. please debug before using");
+    return;
+    Serial.println("Choose a baud rate:");
+    Serial.println("1 | 1200 bps");
+    Serial.println("2 | 2400 bps");
+    Serial.println("3 | 4800 bps");
+    Serial.println("4 | 9600 bps");
+    Serial.println("5 | 19200 bps");
+    Serial.println("6 | 38400 bps");
+    Serial.println("7 | 57600 bps");
+    Serial.println("8 | 115200 bps");
+    Serial.print("> ");
+    while(!Serial.available())
+    {
+    }
+    String bd = Serial.readString();
+    bd = bd.trim();
+    int int_bd = bd.toInt();
+    if(int_bd <= 8 && int_bd >= 1)
+    {
+      char char_bd[1];
+      itoa(int_bd, char_bd, 10); //10 is the base
+      char cmd[10] = "AT+BAUD"; //command for baud rate setting
+      cmd[7] = char_bd[0]; //add the number at the end
+      cmd[8] = '\n'; //add newline at end as well
+      cmd[9] = '\r';
+      Serial.print("Debug, writing command: ");
+      Serial.println(cmd);
+      hc.write(cmd); //change baud rate on HC06
+      delay(1000); 
+      hc.end(); //end serial comms with HC06
+      //the baud rate selected is 1200 * 2^(n - 1) where n is int_bd
+      int real_bd = 1200 * pow(2, int_bd - 1);
+      //UNLESS, option is 7 or 8, the scheme switches... stupidly
+      if(int_bd == 7)
+      {
+        real_bd = 57600;
+      }
+      else if(int_bd == 8)
+      {
+        real_bd = 115200;
+      }
+      Serial.println("Debug, setting baud rate to");
+      Serial.println(real_bd);
+      hc.begin(real_bd); //set new baud rate
+      delay(2000);
+      return;
+    }
+    else
+    {
+      Serial.println("Not a correct option, must be 1 through 8. Try again");
+      return;
+    }
+    
+  }
+  else if(option == "1")
+  {
+    Serial.println("Not coded yet, but slotted.");
+    return;
+  }
+  else if(option == "2")
+  {
+    Serial.println("Not coded yet, but slotted.");
+    return;
+  }
+  else if(option == "3")
+  {
+    state = "statechange: default";
+    return;
+  }
+  else
+  {
+    Serial.print("Sorry, that option, ");
+    Serial.print(option);
+    Serial.println(", is not coded in yet. Try again");
+    return; //no statechange, just re-enter this state.
+  }
 }
 
 /*****Other Functions ******/
